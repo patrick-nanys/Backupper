@@ -1,0 +1,5 @@
+Backup to:
+D:\Test area\To
+Backup from:
+D:\Test area\From1
+D:\Test area\From2

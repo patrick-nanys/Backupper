@@ -1,2 +1,2 @@
 # Backupper
-Python script to backup files
+Multithreaded python script to backup files
