@@ -1,14 +1,11 @@
+import concurrent.futures
 import os
-import queue
 import subprocess
-import threading
+import sys
+import time
 
 
 class Backupper:
-
-    def __init__(self):
-        self.file_queue = queue.Queue()
-        self.error_queue = queue.Queue()
 
     def backup(self, backup_file):
         """Backup paths described in the given file
@@ -20,15 +17,19 @@ class Backupper:
         (backup_to, backup_from) = self.read_backup_info(backup_file)
 
         if not (backup_to, backup_from) == ('', ''):
-            print('Scanning file system...\n')
             amount_to_back_up, items_to_backup = self.scan(backup_to, backup_from)
-            if amount_to_back_up == 0:
-                print("\n\nEverything's up to date!\n\n")
-            else:
+            if amount_to_back_up > 0:
                 print('Amount to backup: %s\n' % self.get_proper_size_from(amount_to_back_up))
                 choice = input('Do you want to backup now? (y/n) ')
                 if choice.lower() == 'y':
-                    self.backup_with_threading(items_to_backup)
+                    start1 = time.perf_counter()
+                    while len(items_to_backup) > 0:
+                        self.backup_with_threading(items_to_backup)
+                        print()
+                        items_to_backup = self.rescan(items_to_backup)
+                    end1 = time.perf_counter()
+                    print('Time: %f' % (end1-start1))
+            print("\n\nEverything's up to date!\n\n")
 
         input('---Press ENTER to exit---')
 
@@ -102,6 +103,7 @@ class Backupper:
         :param backup_from: paths to files/folders we want to backup
         :return: amount to backup in bytes, tuples of source and destination of files to backup
         """
+        print('Scanning file system...\n')
         scan_list = []
         items_to_backup = []
         amount_to_back_up = 0
@@ -138,6 +140,25 @@ class Backupper:
 
         return amount_to_back_up, items_to_backup
 
+    def rescan(self, items_to_backup):
+        """Rescan for items left over, because the OS was overloaded with copy calls
+
+        :param items_to_backup: items that have been tried to be backed up
+        :return: items that were not copied
+        """
+        print('\nScanning for leftovers...\n')
+        items_not_copied = []
+        for item in items_to_backup:
+            src = item[0]
+            dest = item[1]
+            src_mod_time = os.path.getmtime(src)
+            dest_mod_time = 0.0 if not os.path.exists(dest) else os.path.getmtime(dest)
+
+            if src_mod_time > dest_mod_time:
+                items_not_copied.append(item)
+
+        return items_not_copied
+
     def copy(self, item):
         """Faster way to copy with error handling
 
@@ -145,30 +166,23 @@ class Backupper:
         :return: error message if there was any
         """
         try:
-            print('copying... ' + item[0])
-            cmd = 'echo f | xcopy /q /h /y "%s" "%s"' % (item[0], item[1])
-            success = subprocess.call(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-            if success != 0:
-                print('-- ERROR! There was a problem copying: %s' % item[0])
-                return 'There was a problem copying: %s' % item[0]
-        except IOError as e:
-            print("Couldn't copy: %s" % e)
-            return e
-        return ''
-
-    def thread_copy_next(self):
-        """Copy next item in file_queue with a thread
-
-        :return:
-        """
-        while True:
-            item = self.file_queue.get()
-            if item is None:
-                break
-            error = self.copy(item)
-            if error != '':
-                self.error_queue.put(error)
-            self.file_queue.task_done()
+            # print('copying... ' + item[0])
+            print(item[0])
+            try:
+                cmd = 'echo f | xcopy /q /h /y "%s" "%s"' % (item[0], item[1])
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=True)
+            except subprocess.CalledProcessError as e:
+                error = 'Subprocess error: %s %s %s %s %s' % (e.returncode, e.cmd, e.output, e.stdout, e.stderr)
+                print(error)
+                # self.error_queue.put(error)
+                return error
+        except IOError:
+            error_type, value, traceback = sys.exc_info()
+            error = 'IOError copying %s: %s (item: %s)' % (value.filename, value.strerror, item[0])
+            print(error)
+            # self.error_queue.put(error)
+            return error
+        return None
 
     def backup_with_threading(self, items_to_backup):
         """Copy given list of items with multiple threads
@@ -176,32 +190,15 @@ class Backupper:
         :param items_to_backup: tuples of source and destination of files
         :return:
         """
-        # create threads
-        number_of_threads = 4
-        threads = []
-        for i in range(number_of_threads):
-            t = threading.Thread(target=self.thread_copy_next)
-            t.daemon = True
-            t.start()
-            threads.append(t)
+        # run threads
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(self.copy, f) for f in items_to_backup]
 
-        # fill up queue and wait for processing
-        for item in items_to_backup:
-            self.file_queue.put(item)
-        self.file_queue.join()
-
-        # stop threads
-        for i in range(number_of_threads):
-            self.file_queue.put(None)
-        for t in threads:
-            t.join()
-
-        print("\n\nEverything's up to date!\n\n")
-
-        # print errors that occurred during backup
-        error_list = list(self.error_queue.queue)
-        for e in error_list:
-            print("Couldn't copy: %s" % e)
+            # print errors
+            for future in futures:
+                if future.result() is not None:
+                    print(future.result())
+            print()
 
     def get_proper_size_from(self, amount):
         """Creates proper size format from amount
